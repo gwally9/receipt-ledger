@@ -19,7 +19,9 @@ from datetime import datetime
 from pathlib import Path
 
 import anthropic
-from flask import Flask, render_template, send_from_directory, jsonify, request, g
+from PIL import Image
+import io
+from flask import Flask, render_template, send_from_directory, jsonify, request, g, Response
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 DEFAULT_RECEIPT_DIR = os.path.expanduser("./receipts")   # change or set RECEIPT_DIR env var
@@ -30,6 +32,9 @@ os.makedirs(RECEIPT_DIR, exist_ok=True)
 DB_PATH = os.path.join(RECEIPT_DIR, "receipts.db")
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"}
+
+# Claude model - haiku=speed/cheap, sonnet=balanced, opus=best quality
+CLAUDE_MODEL = "claude-3-5-haiku-20241022"  # change or use CLAUDE_MODEL env var
 
 app = Flask(__name__)
 client = anthropic.Anthropic()           # reads ANTHROPIC_API_KEY from env
@@ -65,6 +70,9 @@ def init_db():
                 scanned_at  TEXT
             )
         """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_receipts_date ON receipts(date)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_receipts_status ON receipts(scan_status)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_receipts_hash ON receipts(file_hash)")
         # Non-destructive migration: add file_hash to any pre-existing database
         cols = {row[1] for row in db.execute("PRAGMA table_info(receipts)")}
         if "file_hash" not in cols:
@@ -79,6 +87,29 @@ def hash_file(filepath: str) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+# ── Image optimization ──────────────────────────────────────────────────────────
+def resize_image_optional(filepath: str, max_dim: int = 1024) -> str:
+    """Resize large images to reduce API payload. Returns base64 string."""
+    try:
+        with Image.open(filepath) as img:
+            # Convert HEIC/HEIF to JPEG for consistent handling
+            if img.format.lower() in ("heic", "heif"):
+                img = img.convert("RGB")
+            
+            # Only resize if needed
+            if max(img.size) > max_dim:
+                ratio = max_dim / max(img.size)
+                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+            
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85, optimize=True)
+            return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        # Fallback to original if resize fails
+        with open(filepath, "rb") as f:
+            return base64.standard_b64encode(f.read()).decode("utf-8")
 
 # ── Claude vision scanning ─────────────────────────────────────────────────────
 EXTRACTION_PROMPT = """You are a receipt parser. Examine this receipt image and extract:
@@ -102,11 +133,14 @@ def scan_image(filepath: str) -> dict:
     }
     media_type = mime_map.get(ext, "image/jpeg")
 
-    with open(filepath, "rb") as f:
-        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+    if os.path.getsize(filepath) > 5_000_000:  # >5MB - downsample
+        image_data = resize_image_optional(filepath, max_dim=1024)
+    else:
+        with open(filepath, "rb") as f:
+            image_data = base64.standard_b64encode(f.read()).decode("utf-8")
 
     message = client.messages.create(
-        model="claude-opus-4-5",
+        model=CLAUDE_MODEL,
         max_tokens=512,
         messages=[{
             "role": "user",
@@ -227,6 +261,29 @@ def scan_directory(receipt_dir: str, rescan: bool = False) -> dict:
 
     return counts
 
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+from functools import wraps
+from time import time
+
+_rate_limit_store: dict[str, list[float]] = {}
+
+def rate_limit(calls: int, window: int):
+    """Decorator: allow `calls` requests per `window` seconds per IP."""
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            ip = request.remote_addr or "local"
+            now = time()
+            if ip not in _rate_limit_store:
+                _rate_limit_store[ip] = []
+            _rate_limit_store[ip] = [t for t in _rate_limit_store[ip] if now - t < window]
+            if len(_rate_limit_store[ip]) >= calls:
+                return jsonify({"error": "rate limited", "retry_after": window}), 429
+            _rate_limit_store[ip].append(now)
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
 # ── Background initial scan ───────────────────────────────────────────────────
 _scan_lock = threading.Lock()
 _scan_status = {"running": False, "last_result": None}
@@ -293,6 +350,7 @@ def serve_photo(filename):
     return send_from_directory(RECEIPT_DIR, filename)
 
 @app.route("/api/scan", methods=["POST"])
+@rate_limit(calls=3, window=60)   # max 3 scans per minute
 def api_scan():
     """Trigger a background scan. Pass ?rescan=1 to re-process all files."""
     if _scan_status["running"]:
@@ -305,6 +363,20 @@ def api_scan():
 @app.route("/api/scan/status")
 def api_scan_status():
     return jsonify(_scan_status)
+
+@app.route("/api/scan/stream")
+def api_scan_stream():
+    """SSE endpoint for real-time scan progress."""
+    def generate():
+        import time
+        while True:
+            status = _scan_status.copy()
+            yield f"data: {json.dumps(status)}\n\n"
+            if not status["running"]:
+                break
+            time.sleep(1)
+        yield f"data: {{\"done\": true}}\n\n"
+    return Response(generate(), mimetype="text/event-stream")
 
 @app.route("/api/receipt/<int:receipt_id>", methods=["DELETE"])
 def delete_receipt(receipt_id):

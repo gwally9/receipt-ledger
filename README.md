@@ -5,6 +5,28 @@ build a searchable expense ledger with monthly summaries and YTD totals.
 
 ---
 
+## Configuration
+
+Edit these constants at the top of `app.py`:
+
+```python
+CLAUDE_MODEL = "claude-3-5-haiku-20241022"  # haiku=speed, sonnet=balanced, opus=quality
+DEFAULT_RECEIPT_DIR = "./receipts"  # change or set RECEIPT_DIR env var
+```
+
+Or set `ANTHROPIC_API_KEY` and `RECEIPT_DIR` via environment variables.
+
+## Performance Optimizations
+
+- **Smart model selection**: Uses Haiku by default (10x cheaper, faster than Opus)
+- **Image optimization**: Large images (>5MB) are auto-resized before upload
+- **Content-based dedup**: MD5 hashing skips already-scanned files
+- **Database indexes**: Optimized queries on date, status, and hash columns
+- **Rate limiting**: API endpoints protected against abuse (3 scans/min)
+- **SSE streaming**: Real-time scan progress via `/api/scan/stream`
+
+---
+
 ## Quick Start
 
 ### 1. Install dependencies
@@ -27,7 +49,16 @@ export RECEIPT_DIR="/path/to/your/receipts"
 **Option B — edit `app.py` directly:**
 Change `DEFAULT_RECEIPT_DIR` near the top of `app.py`.
 
-### 4. Run the app
+### 4. (Optional) Configure Claude model
+```bash
+# Fast/cheap (default):
+export CLAUDE_MODEL="claude-3-5-haiku-20241022"
+
+# High quality:
+export CLAUDE_MODEL="claude-sonnet-4-20250514"
+```
+
+### 5. Run the app
 ```bash
 python app.py
 ```
