@@ -33,8 +33,13 @@ DB_PATH = os.path.join(RECEIPT_DIR, "receipts.db")
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"}
 
+# Claude model - use haiku for speed/cost, opus for quality
+
 # Claude model - haiku=speed/cheap, sonnet=balanced, opus=best quality
 CLAUDE_MODEL = "claude-3-5-haiku-20241022"  # change or use CLAUDE_MODEL env var
+### OR
+### CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-haiku-20241022")
+### set via CLI var
 
 app = Flask(__name__)
 client = anthropic.Anthropic()           # reads ANTHROPIC_API_KEY from env
